@@ -112,7 +112,7 @@ def recompute_w_u_fwd_kernel(
         )
         b_k = tl.load(p_k, boundary_check=(0, 1))
         b_kb = (b_k * b_beta[:, None] * b_g[:, None]).to(b_k.dtype)
-        b_w = tl.dot(b_A, b_kb)
+        b_w = tl.dot(b_A, b_kb, allow_tf32=False)
         tl.store(p_w, b_w.to(p_w.dtype.element_ty), boundary_check=(0, 1))
 
 

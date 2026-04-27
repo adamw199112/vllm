@@ -97,19 +97,16 @@ def chunk_fwd_kernel_o(
         p_k = tl.make_block_ptr(
             k, (K, T), (1, Hg * K), (i_k * BK, i_t * BT), (BK, BT), (0, 1)
         )
-        p_h = tl.make_block_ptr(
-            h, (V, K), (K, 1), (i_v * BV, i_k * BK), (BV, BK), (1, 0)
-        )
-        # [BT, BK]
+        # Convert p_h to offset+arange since b_h is transformed via tl.trans() before dot
+        t_offsets_h = i_v * BV + tl.arange(0, BV)
+        k_offsets = i_k * BK + tl.arange(0, BK)
+        h_offsets = t_offsets_h[:, None] * K + k_offsets[None, :]
+        h_mask = (t_offsets_h[:, None] < V) & (k_offsets[None, :] < K)
+        b_h = tl.load(h + h_offsets, mask=h_mask, other=0.0)
         b_q = tl.load(p_q, boundary_check=(0, 1))
-        # [BK, BT]
         b_k = tl.load(p_k, boundary_check=(0, 1))
-        # [BV, BK]
-        b_h = tl.load(p_h, boundary_check=(0, 1))
 
-        # [BT, BK] @ [BK, BV] -> [BT, BV]
         b_o += tl.dot(b_q, tl.trans(b_h))
-        # [BT, BK] @ [BK, BT] -> [BT, BT]
         b_A += tl.dot(b_q, b_k)
 
     if USE_G:
@@ -124,18 +121,25 @@ def chunk_fwd_kernel_o(
     m_A = (o_t[:, None] >= o_t[None, :]) & (m_t[:, None] & m_t)
     b_A = tl.where(m_A, b_A, 0)
 
+    # Convert p_o to offset+arange, keep v as block_ptr (b_v goes directly to tl.dot)
+    t_offsets_o = i_t * BT + tl.arange(0, BT)
+    v_idx_offsets = i_v * BV + tl.arange(0, BV)
+    o_offsets_full = t_offsets_o[:, None] * H * V + v_idx_offsets[None, :]
+    o_mask = (t_offsets_o[:, None] < T) & (v_idx_offsets[None, :] < V)
+
     p_v = tl.make_block_ptr(
         v, (T, V), (H * V, 1), (i_t * BT, i_v * BV), (BT, BV), (1, 0)
     )
-    p_o = tl.make_block_ptr(
-        o, (T, V), (H * V, 1), (i_t * BT, i_v * BV), (BT, BV), (1, 0)
-    )
     b_v = tl.load(p_v, boundary_check=(0, 1))
+    # p_o = tl.make_block_ptr(
+    #     o, (T, V), (H * V, 1), (i_t * BT, i_v * BV), (BT, BV), (1, 0)
+    # )
 
     # to fix mma -> mma layout conversion
     # already solved by triton v3.2 or higher
     b_o = b_o * scale + tl.dot(b_A.to(b_v.dtype), b_v) * scale
-    tl.store(p_o, b_o.to(p_o.dtype.element_ty), boundary_check=(0, 1))
+    tl.store(o + o_offsets_full, b_o.to(tl.float32), mask=o_mask)
+    # tl.store(p_o, b_o.to(p_o.dtype.element_ty), boundary_check=(0, 1))
 
 
 def chunk_fwd_o(

@@ -115,7 +115,7 @@ def fused_recurrent_gated_delta_rule_fwd_kernel(
                 return
             p_h0 = h0 + state_idx * stride_init_state_token
         else:
-            p_h0 = h0 + bos * HV * V * K
+            p_h0 = h0 + i_n * HV * V * K
         p_h0 = p_h0 + i_hv * V * K + o_v[:, None] * K + o_k[None, :]
         b_h += tl.load(p_h0, mask=mask_h, other=0).to(tl.float32)
 

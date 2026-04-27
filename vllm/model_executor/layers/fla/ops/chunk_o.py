@@ -111,8 +111,9 @@ def chunk_fwd_kernel_o(
 
     if USE_G:
         g += bos * H + i_h
-        p_g = tl.make_block_ptr(g, (T,), (H,), (i_t * BT,), (BT,), (0,))
-        b_g = tl.load(p_g, boundary_check=(0,))
+        offs_t = i_t * BT + tl.arange(0, BT)
+        ptrs = g + offs_t * H
+        b_g = tl.load(ptrs, mask=offs_t < T, other=0)
         b_o = b_o * exp(b_g)[:, None]
         b_A = b_A * exp(b_g[:, None] - b_g[None, :])
 

@@ -46,22 +46,24 @@ def fused_recurrent_gated_delta_rule_fwd_kernel(
         i_hv = i_nh % HV
         i_h = i_hv // (HV // H)
 
-        for i_v in range(NV):
-            for i_k in range(NK):
-                if IS_VARLEN:
-                    bos = tl.load(cu_seqlens + i_n).to(tl.int64)
-                    eos = tl.load(cu_seqlens + i_n + 1).to(tl.int64)
-                    all_T = T
-                    T_val = eos - bos
-                else:
-                    bos = i_n * T
-                    eos = i_n * T + T
-                    all_T = B * T
-                    T_val = T
+        if IS_VARLEN:
+            bos = tl.load(cu_seqlens + i_n).to(tl.int64)
+            eos = tl.load(cu_seqlens + i_n + 1).to(tl.int64)
+            T_val = eos - bos
+        else:
+            bos = i_n * T
+            eos = i_n * T + T
+            T_val = T
 
-                if T_val > 0:
+        if T_val > 0:
+            for i_v in range(NV):
+                o_v = i_v * BV + tl.arange(0, BV)
+                mask_v = o_v < V
+
+                for i_k in range(NK):
                     o_k = i_k * BK + tl.arange(0, BK)
-                    o_v = i_v * BV + tl.arange(0, BV)
+                    mask_k = o_k < K
+                    mask_h = mask_v[:, None] & mask_k[None, :]
 
                     p_q = q + (bos * H + i_h) * K + o_k
                     p_k = k + (bos * H + i_h) * K + o_k
@@ -76,12 +78,6 @@ def fused_recurrent_gated_delta_rule_fwd_kernel(
                     else:
                         p_gk = g + (bos * HV + i_hv) * K + o_k
 
-                    p_o = o + ((i_k * all_T + bos) * HV + i_hv) * V + o_v
-
-                    mask_k = o_k < K
-                    mask_v = o_v < V
-                    mask_h = mask_v[:, None] & mask_k[None, :]
-
                     b_h = tl.zeros([BV, BK], dtype=tl.float32)
                     if USE_INITIAL_STATE:
                         if IS_CONTINUOUS_BATCHING:
@@ -89,9 +85,7 @@ def fused_recurrent_gated_delta_rule_fwd_kernel(
                                 i_t_init = tl.load(num_accepted_tokens + i_n).to(tl.int64) - 1
                             else:
                                 i_t_init = 0
-                            state_idx = tl.load(ssm_state_indices + i_n * stride_indices_seq + i_t_init).to(
-                                tl.int64
-                            )
+                            state_idx = tl.load(ssm_state_indices + i_n * stride_indices_seq + i_t_init).to(tl.int64)
                             if state_idx > 0:
                                 p_h0 = h0 + state_idx * stride_init_state_token
                                 p_h0 = p_h0 + i_hv * V * K + o_v[:, None] * K + o_k[None, :]
@@ -128,7 +122,14 @@ def fused_recurrent_gated_delta_rule_fwd_kernel(
                         b_h += b_v[:, None] * b_k[None, :]
 
                         b_o = tl.sum(b_h * b_q[None, :], 1)
-                        tl.store(p_o, b_o.to(tl.float16), mask=mask_v)
+
+                        # Read-modify-write 累加到输出
+                        p_o = o + ((bos + i_t) * HV + i_hv) * V + o_v
+                        if i_k == 0:
+                            tl.store(p_o, b_o.to(tl.float16), mask=mask_v)
+                        else:
+                            b_o_prev = tl.load(p_o, mask=mask_v, other=0).to(tl.float32)
+                            tl.store(p_o, (b_o_prev + b_o).to(tl.float16), mask=mask_v)
 
                         if INPLACE_FINAL_STATE:
                             final_state_idx = tl.load(
@@ -145,7 +146,6 @@ def fused_recurrent_gated_delta_rule_fwd_kernel(
 
                         p_q += H * K
                         p_k += H * K
-                        p_o += HV * V
                         p_v += HV * V
                         if not IS_KDA:
                             p_g += HV
@@ -178,7 +178,7 @@ def fused_recurrent_gated_delta_rule_fwd(
     num_stages = 3
     num_warps = 1
 
-    o = q.new_empty(NK, *v.shape)
+    o = q.new_empty(*v.shape)
     if inplace_final_state:
         final_state = initial_state
     else:
@@ -241,8 +241,4 @@ def fused_recurrent_gated_delta_rule_fwd(
         IS_SPEC_DECODING=is_spec_decoding,
         IS_KDA=False,
     )
-    if NK == 1:
-        o = o.squeeze(0)
-    else:
-        o = o.sum(dim=0)
     return o, final_state

@@ -59,11 +59,10 @@ def fused_recurrent_gated_delta_rule_fwd_kernel(
             for i_v in range(NV):
                 o_v = i_v * BV + tl.arange(0, BV)
                 mask_v = o_v < V
+                p_o_base = o + (bos * HV + i_hv) * V + o_v
 
                 for i_k in range(NK):
                     o_k = i_k * BK + tl.arange(0, BK)
-                    mask_k = o_k < K
-                    mask_h = mask_v[:, None] & mask_k[None, :]
 
                     p_q = q + (bos * H + i_h) * K + o_k
                     p_k = k + (bos * H + i_h) * K + o_k
@@ -77,6 +76,9 @@ def fused_recurrent_gated_delta_rule_fwd_kernel(
                         p_g = g + bos * HV + i_hv
                     else:
                         p_gk = g + (bos * HV + i_hv) * K + o_k
+
+                    mask_k = o_k < K
+                    mask_h = mask_v[:, None] & mask_k[None, :]
 
                     b_h = tl.zeros([BV, BK], dtype=tl.float32)
                     if USE_INITIAL_STATE:
@@ -122,14 +124,11 @@ def fused_recurrent_gated_delta_rule_fwd_kernel(
                         b_h += b_v[:, None] * b_k[None, :]
 
                         b_o = tl.sum(b_h * b_q[None, :], 1)
-
-                        # Read-modify-write 累加到输出
-                        p_o = o + ((bos + i_t) * HV + i_hv) * V + o_v
                         if i_k == 0:
-                            tl.store(p_o, b_o.to(tl.float16), mask=mask_v)
+                            tl.store(p_o_base + i_t * HV * V, b_o.to(tl.float16), mask=mask_v)
                         else:
-                            b_o_prev = tl.load(p_o, mask=mask_v, other=0).to(tl.float32)
-                            tl.store(p_o, (b_o_prev + b_o).to(tl.float16), mask=mask_v)
+                            b_o_prev = tl.load(p_o_base + i_t * HV * V, mask=mask_v, other=0).to(tl.float32)
+                            tl.store(p_o_base + i_t * HV * V, (b_o_prev + b_o).to(tl.float16), mask=mask_v)
 
                         if INPLACE_FINAL_STATE:
                             final_state_idx = tl.load(

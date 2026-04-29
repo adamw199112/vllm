@@ -49,11 +49,13 @@ def fused_recurrent_gated_delta_rule_fwd_kernel(
         if IS_VARLEN:
             bos = tl.load(cu_seqlens + i_n).to(tl.int64)
             eos = tl.load(cu_seqlens + i_n + 1).to(tl.int64)
+            all = T
             T_val = eos - bos
         else:
             bos = i_n * T
             eos = i_n * T + T
             T_val = T
+            all = B * T
 
         if T_val > 0:
             for i_v in range(NV):
@@ -76,8 +78,9 @@ def fused_recurrent_gated_delta_rule_fwd_kernel(
                         p_g = g + bos * HV + i_hv
                     else:
                         p_gk = g + (bos * HV + i_hv) * K + o_k
-
+                    p_o = o + ((i_k * all + bos) * HV + i_hv) * V + o_v
                     mask_k = o_k < K
+                    mask_v = o_v < V
                     mask_h = mask_v[:, None] & mask_k[None, :]
 
                     b_h = tl.zeros([BV, BK], dtype=tl.float32)
@@ -90,12 +93,11 @@ def fused_recurrent_gated_delta_rule_fwd_kernel(
                             state_idx = tl.load(ssm_state_indices + i_n * stride_indices_seq + i_t_init).to(tl.int64)
                             if state_idx > 0:
                                 p_h0 = h0 + state_idx * stride_init_state_token
-                                p_h0 = p_h0 + i_hv * V * K + o_v[:, None] * K + o_k[None, :]
-                                b_h += tl.load(p_h0, mask=mask_h, other=0).to(tl.float32)
+
                         else:
                             p_h0 = h0 + i_n * HV * V * K
-                            p_h0 = p_h0 + i_hv * V * K + o_v[:, None] * K + o_k[None, :]
-                            b_h += tl.load(p_h0, mask=mask_h, other=0).to(tl.float32)
+                        p_h0 = p_h0 + i_hv * V * K + o_v[:, None] * K + o_k[None, :]
+                        b_h += tl.load(p_h0, mask=mask_h, other=0).to(tl.float32)
 
                     for i_t in range(0, T_val):
                         b_q = tl.load(p_q, mask=mask_k, other=0).to(tl.float32)
@@ -124,11 +126,8 @@ def fused_recurrent_gated_delta_rule_fwd_kernel(
                         b_h += b_v[:, None] * b_k[None, :]
 
                         b_o = tl.sum(b_h * b_q[None, :], 1)
-                        if i_k == 0:
-                            tl.store(p_o_base + i_t * HV * V, b_o.to(tl.float16), mask=mask_v)
-                        else:
-                            b_o_prev = tl.load(p_o_base + i_t * HV * V, mask=mask_v, other=0).to(tl.float32)
-                            tl.store(p_o_base + i_t * HV * V, (b_o_prev + b_o).to(tl.float16), mask=mask_v)
+                        tl.store(p_o, b_o.to(tl.float16), mask=mask_v)
+
 
                         if INPLACE_FINAL_STATE:
                             final_state_idx = tl.load(
@@ -145,6 +144,7 @@ def fused_recurrent_gated_delta_rule_fwd_kernel(
 
                         p_q += H * K
                         p_k += H * K
+                        p_o += HV * V
                         p_v += HV * V
                         if not IS_KDA:
                             p_g += HV
@@ -167,13 +167,45 @@ def fused_recurrent_gated_delta_rule_fwd(
     num_accepted_tokens: torch.Tensor | None = None,
     use_qk_l2norm_in_kernel: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    
+    """
+   implementation of the fused recurrent gated delta rule.
+
+    Computes per-step:
+        h *= exp(g)           # decay
+        v_new = v - h @ k     # delta rule
+        v_new *= beta          # beta gate
+        h += v_new ⊗ k         # update
+        o = h @ q              # output
+
+    Args:
+        q: [B, T, H, K]  queries
+        k: [B, T, H, K]  keys
+        v: [B, T, HV, V]  values (GVA: HV >= H)
+        g: [B, T, HV]  decays
+        beta: [B, T, HV] or [B, T, HV, V]  betas
+        scale: scale factor for q
+        initial_state: [N, HV, V, K]  initial hidden states
+        inplace_final_state: if True, final_state shares storage with initial_state
+        cu_seqlens: [N+1]  cumulative sequence lengths (varlen)
+        ssm_state_indices: indices for state mapping (ignored here)
+        num_accepted_tokens: for spec decoding (ignored here)
+        use_qk_l2norm_in_kernel: whether to L2-normalize q and k
+
+    Returns:
+        o: [B, T, HV, V]  output
+        final_state: per-sequence final hidden states [N, HV, V, K]
+    """
+    
+    
     B, T, H, K, V = *k.shape, v.shape[-1]
     HV = v.shape[2]
     N = B if cu_seqlens is None else len(cu_seqlens) - 1
-    BK = min(triton.next_power_of_2(K), 32)
+    BK = triton.next_power_of_2(K)
     BV = min(triton.next_power_of_2(V), 32)
     NK = triton.cdiv(K, BK)
     NV = triton.cdiv(V, BV)
+    assert NK == 1, "NK > 1 is not supported yet"
     num_stages = 3
     num_warps = 1
 

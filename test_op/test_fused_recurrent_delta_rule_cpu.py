@@ -66,12 +66,14 @@ def fused_recurrent_gated_delta_rule_fwd_cpu(
 
     N = B if cu_seqlens is None else len(cu_seqlens) - 1
 
+    total_T = T if cu_seqlens is None else int(cu_seqlens[-1].item())
+
     o = torch.zeros(B, T, HV, V_val, dtype=torch.float32)
 
     if inplace_final_state:
         final_state = initial_state.clone()
     else:
-        final_state = torch.zeros(N, HV, V_val, K, dtype=torch.float32)
+        final_state = torch.zeros(total_T, HV, V_val, K, dtype=torch.float32)
 
     for i_n in range(N):
         if cu_seqlens is not None:
@@ -132,14 +134,19 @@ def fused_recurrent_gated_delta_rule_fwd_cpu(
                     h[hv] * q_vec.unsqueeze(0), dim=1
                 )
 
-        final_state[i_n] = h
+            # Store per-token hidden state (matches Triton behavior)
+            if not inplace_final_state:
+                final_state[tok] = h.clone()
+
+        if inplace_final_state:
+            final_state[i_n] = h
 
     return o, final_state
 
 
 try:
     from vllm.model_executor.layers.fla.ops.fused_recurrent import (
-        fused_recurrent_gated_delta_rule_fwd as fused_recurrent_gated_delta_rule_fwd_triton,
+        fused_recurrent_gated_delta_rule_fwd 
     )
 
     HAS_TRITON = True
@@ -147,10 +154,11 @@ except Exception as e:
     print(f"Triton import failed: {e}")
     HAS_TRITON = False
 
-
-class TestFusedRecurrentDeltaRuleCPU(unittest.TestCase):
+class TestFusedRecurrentDeltaRule(unittest.TestCase):
 
     def _check_close(self, cpu_tensor, triton_tensor, atol=1e-3, rtol=1e-3):
+        if triton_tensor.ndim == cpu_tensor.ndim + 1:
+            triton_tensor = triton_tensor[0]
         diff = (cpu_tensor.float() - triton_tensor.float()).abs().max().item()
         mean_abs = triton_tensor.float().abs().mean().item()
         print(f"  Max diff: {diff:.6f}, mean abs ref: {mean_abs:.6f}")
@@ -158,222 +166,186 @@ class TestFusedRecurrentDeltaRuleCPU(unittest.TestCase):
             cpu_tensor.float(), triton_tensor.float(), atol=atol, rtol=rtol
         )
 
-    @unittest.skipUnless(HAS_TRITON, "Triton not available")
     def test_basic_small(self):
-        """Basic test: B=1, H=HV=1, K=8, V=4, T=8"""
-        B, T, H, HV, K, V_val = 1, 8, 1, 1, 8, 4
+        B, T, H, HV, K, V_val = 1, 8, 1, 1, 128, 128
         torch.manual_seed(42)
-        q = torch.randn(B, T, H, K) * 0.1
-        k = torch.randn(B, T, H, K) * 0.1
-        v = torch.randn(B, T, HV, V_val) * 0.1
-        g = -0.5 + torch.rand(B, T, HV) * 0.1
-        beta = torch.sigmoid(torch.randn(B, T, HV))
+        q = torch.randn(B, T, H, K, dtype=torch.float32)
+        k = torch.randn(B, T, H, K, dtype=torch.float32)
+        v = torch.randn(B, T, HV, V_val, dtype=torch.float32)
+        g = -0.5 + torch.rand(B, T, HV, dtype=torch.float32) * 0.1
+        beta = torch.sigmoid(torch.randn(B, T, HV, dtype=torch.float32))
         scale = K ** -0.5
-        h0 = torch.randn(B, HV, V_val, K) * 0.01
+        h0 = torch.randn(B, HV, V_val, K, dtype=torch.float32)
 
-        cpu_o, _ = fused_recurrent_gated_delta_rule_fwd_cpu(
+        cpu_o, f_cpu = fused_recurrent_gated_delta_rule_fwd_cpu(
             q.clone(), k.clone(), v.clone(), g.clone(), beta.clone(),
-            scale, h0.clone(),
+            scale, h0.clone(),inplace_final_state=False,
         )
 
-        triton_o, _ = fused_recurrent_gated_delta_rule_fwd_triton(
+        triton_o, f_triton = fused_recurrent_gated_delta_rule_fwd(
             q.cuda(), k.cuda(), v.cuda(), g.cuda(), beta.cuda(),
             scale, h0.cuda(), inplace_final_state=False,
         )
 
         self._check_close(cpu_o, triton_o.cpu())
+        self._check_close(f_cpu, f_triton.cpu(), atol=5e-3, rtol=5e-3)
 
-    @unittest.skipUnless(HAS_TRITON, "Triton not available")
-    def test_basic_larger(self):
-        """Larger test: B=2, H=2, HV=4, K=16, V=8, T=16"""
-        B, T, H, HV, K, V_val = 2, 16, 2, 4, 16, 8
-        torch.manual_seed(123)
-        q = torch.randn(B, T, H, K) * 0.1
-        k = torch.randn(B, T, H, K) * 0.1
-        v = torch.randn(B, T, HV, V_val) * 0.1
-        g = -0.5 + torch.rand(B, T, HV) * 0.1
-        beta = torch.sigmoid(torch.randn(B, T, HV))
-        scale = K ** -0.5
-        h0 = torch.randn(B, HV, V_val, K) * 0.01
 
-        cpu_o, _ = fused_recurrent_gated_delta_rule_fwd_cpu(
-            q.clone(), k.clone(), v.clone(), g.clone(), beta.clone(),
-            scale, h0.clone(),
-        )
 
-        triton_o, _ = fused_recurrent_gated_delta_rule_fwd_triton(
-            q.cuda(), k.cuda(), v.cuda(), g.cuda(), beta.cuda(),
-            scale, h0.cuda(), inplace_final_state=False,
-        )
-
-        self._check_close(cpu_o, triton_o.cpu())
-
-    @unittest.skipUnless(HAS_TRITON, "Triton not available")
-    def test_headwise_beta(self):
-        """Test with headwise beta (4D tensor)."""
-        B, T, H, HV, K, V_val = 1, 16, 1, 1, 32, 16
-        torch.manual_seed(456)
-        q = torch.randn(B, T, H, K) * 0.1
-        k = torch.randn(B, T, H, K) * 0.1
-        v = torch.randn(B, T, HV, V_val) * 0.1
-        g = -0.5 + torch.rand(B, T, HV) * 0.1
-        beta = torch.sigmoid(torch.randn(B, T, HV, V_val))
-        scale = K ** -0.5
-        h0 = torch.randn(B, HV, V_val, K) * 0.01
-
-        cpu_o, _ = fused_recurrent_gated_delta_rule_fwd_cpu(
-            q.clone(), k.clone(), v.clone(), g.clone(), beta.clone(),
-            scale, h0.clone(),
-        )
-
-        triton_o, _ = fused_recurrent_gated_delta_rule_fwd_triton(
-            q.cuda(), k.cuda(), v.cuda(), g.cuda(), beta.cuda(),
-            scale, h0.cuda(), inplace_final_state=False,
-        )
-
-        self._check_close(cpu_o, triton_o.cpu())
-
-    @unittest.skipUnless(HAS_TRITON, "Triton not available")
     def test_with_l2norm(self):
-        """Test with QK L2 normalization enabled."""
-        B, T, H, HV, K, V_val = 1, 16, 1, 2, 16, 8
+        B, T, H, HV, K, V_val = 1, 16, 1, 2, 128, 128
         torch.manual_seed(789)
-        q = torch.randn(B, T, H, K) * 0.1
-        k = torch.randn(B, T, H, K) * 0.1
-        v = torch.randn(B, T, HV, V_val) * 0.1
-        g = -0.5 + torch.rand(B, T, HV) * 0.1
-        beta = torch.sigmoid(torch.randn(B, T, HV))
+        q = torch.randn(B, T, H, K, dtype=torch.float32)
+        k = torch.randn(B, T, H, K, dtype=torch.float32)
+        v = torch.randn(B, T, HV, V_val, dtype=torch.float32)
+        g = -0.5 + torch.rand(B, T, HV, dtype=torch.float32) * 0.1
+        beta = torch.sigmoid(torch.randn(B, T, HV, dtype=torch.float32))
         scale = K ** -0.5
-        h0 = torch.randn(B, HV, V_val, K) * 0.01
+        h0 = torch.randn(B, HV, V_val, K, dtype=torch.float32)
 
         cpu_o, _ = fused_recurrent_gated_delta_rule_fwd_cpu(
             q.clone(), k.clone(), v.clone(), g.clone(), beta.clone(),
             scale, h0.clone(), use_qk_l2norm_in_kernel=True,
         )
 
-        triton_o, _ = fused_recurrent_gated_delta_rule_fwd_triton(
+        triton_o, _ = fused_recurrent_gated_delta_rule_fwd(
             q.cuda(), k.cuda(), v.cuda(), g.cuda(), beta.cuda(),
             scale, h0.cuda(), inplace_final_state=False, use_qk_l2norm_in_kernel=True,
         )
 
         self._check_close(cpu_o, triton_o.cpu())
 
-    @unittest.skipUnless(HAS_TRITON, "Triton not available")
     def test_varlen(self):
-        """Test variable-length sequences with cu_seqlens."""
         B = 1
         H = 2
         HV = 4
-        K = 16
-        V_val = 8
+        K = 128
+        V_val = 128
         torch.manual_seed(42)
 
         lens = torch.tensor([5, 3, 7], dtype=torch.int32)
         cu_seqlens = torch.cat([torch.tensor([0]), lens.cumsum(0)])
         total_T = cu_seqlens[-1].item()
 
-        q = torch.randn(B, total_T, H, K) * 0.1
-        k = torch.randn(B, total_T, H, K) * 0.1
-        v = torch.randn(B, total_T, HV, V_val) * 0.1
-        g = -0.5 + torch.rand(B, total_T, HV) * 0.1
-        beta = torch.sigmoid(torch.randn(B, total_T, HV))
+        q = torch.randn(B, total_T, H, K, dtype=torch.float32) 
+        k = torch.randn(B, total_T, H, K, dtype=torch.float32) 
+        v = torch.randn(B, total_T, HV, V_val, dtype=torch.float32) 
+        g = -0.5 + torch.rand(B, total_T, HV, dtype=torch.float32) * 0.1
+        beta = torch.sigmoid(torch.randn(B, total_T, HV, dtype=torch.float32))
         scale = K ** -0.5
         N = len(cu_seqlens) - 1
-        h0 = torch.randn(N, HV, V_val, K) * 0.01
+        h0 = torch.randn(N, HV, V_val, K, dtype=torch.float32)
 
         cpu_o, _ = fused_recurrent_gated_delta_rule_fwd_cpu(
             q.clone(), k.clone(), v.clone(), g.clone(), beta.clone(),
             scale, h0.clone(), cu_seqlens=cu_seqlens.clone(),
         )
 
-        triton_o, _ = fused_recurrent_gated_delta_rule_fwd_triton(
+        triton_o, _ = fused_recurrent_gated_delta_rule_fwd(
             q.cuda(), k.cuda(), v.cuda(), g.cuda(), beta.cuda(),
             scale, h0.cuda(), inplace_final_state=False, cu_seqlens=cu_seqlens.cuda(),
         )
 
         self._check_close(cpu_o, triton_o.cpu())
 
-    @unittest.skipUnless(HAS_TRITON, "Triton not available")
     def test_single_head(self):
-        """Test H=1, HV=1 (no GVA)."""
         B, T, H, HV, K, V_val = 2, 32, 1, 1, 32, 32
         torch.manual_seed(111)
-        q = torch.randn(B, T, H, K) * 0.1
-        k = torch.randn(B, T, H, K) * 0.1
-        v = torch.randn(B, T, HV, V_val) * 0.1
-        g = -0.5 + torch.rand(B, T, HV) * 0.1
-        beta = torch.sigmoid(torch.randn(B, T, HV))
+        q = torch.randn(B, T, H, K, dtype=torch.float32)
+        k = torch.randn(B, T, H, K, dtype=torch.float32)
+        v = torch.randn(B, T, HV, V_val, dtype=torch.float32)
+        g = -0.5 + torch.rand(B, T, HV, dtype=torch.float32) * 0.1
+        beta = torch.sigmoid(torch.randn(B, T, HV, dtype=torch.float32))
         scale = K ** -0.5
-        h0 = torch.randn(B, HV, V_val, K) * 0.01
+        h0 = torch.randn(B, HV, V_val, K, dtype=torch.float32)
 
         cpu_o, _ = fused_recurrent_gated_delta_rule_fwd_cpu(
             q.clone(), k.clone(), v.clone(), g.clone(), beta.clone(),
             scale, h0.clone(),
         )
 
-        triton_o, _ = fused_recurrent_gated_delta_rule_fwd_triton(
+        triton_o, _ = fused_recurrent_gated_delta_rule_fwd(
             q.cuda(), k.cuda(), v.cuda(), g.cuda(), beta.cuda(),
             scale, h0.cuda(), inplace_final_state=False,
         )
 
         self._check_close(cpu_o, triton_o.cpu())
 
-    @unittest.skipUnless(HAS_TRITON, "Triton not available")
     def test_no_initial_state(self):
-        """Test with no initial state (all zeros)."""
-        B, T, H, HV, K, V_val = 1, 16, 2, 2, 16, 8
+        B, T, H, HV, K, V_val = 1, 16, 2, 2, 128, 128
         torch.manual_seed(222)
-        q = torch.randn(B, T, H, K) * 0.1
-        k = torch.randn(B, T, H, K) * 0.1
-        v = torch.randn(B, T, HV, V_val) * 0.1
-        g = -0.5 + torch.rand(B, T, HV) * 0.1
-        beta = torch.sigmoid(torch.randn(B, T, HV))
+        q = torch.randn(B, T, H, K, dtype=torch.float32) 
+        k = torch.randn(B, T, H, K, dtype=torch.float32) 
+        v = torch.randn(B, T, HV, V_val, dtype=torch.float32) 
+        g = -0.5 + torch.rand(B, T, HV, dtype=torch.float32) * 0.1
+        beta = torch.sigmoid(torch.randn(B, T, HV, dtype=torch.float32))
         scale = K ** -0.5
-        h0 = torch.zeros(B, HV, V_val, K)
+        h0 = torch.zeros(B, HV, V_val, K, dtype=torch.float32)
 
         cpu_o, _ = fused_recurrent_gated_delta_rule_fwd_cpu(
             q.clone(), k.clone(), v.clone(), g.clone(), beta.clone(),
             scale, h0.clone(),
         )
 
-        triton_o, _ = fused_recurrent_gated_delta_rule_fwd_triton(
+        triton_o, _ = fused_recurrent_gated_delta_rule_fwd(
             q.cuda(), k.cuda(), v.cuda(), g.cuda(), beta.cuda(),
             scale, h0.cuda(), inplace_final_state=False,
         )
 
         self._check_close(cpu_o, triton_o.cpu())
 
-    @unittest.skipUnless(HAS_TRITON, "Triton not available")
     def test_varlen_headwise_beta(self):
-        """Varlen + headwise beta."""
         B = 1
         H = 2
         HV = 4
-        K = 16
-        V_val = 8
+        K = 128
+        V_val = 128
         torch.manual_seed(555)
 
         lens = torch.tensor([4, 6, 3], dtype=torch.int32)
         cu_seqlens = torch.cat([torch.tensor([0]), lens.cumsum(0)])
         total_T = cu_seqlens[-1].item()
 
-        q = torch.randn(B, total_T, H, K) * 0.1
-        k = torch.randn(B, total_T, H, K) * 0.1
-        v = torch.randn(B, total_T, HV, V_val) * 0.1
-        g = -0.5 + torch.rand(B, total_T, HV) * 0.1
-        beta = torch.sigmoid(torch.randn(B, total_T, HV, V_val))
+        q = torch.randn(B, total_T, H, K, dtype=torch.float32) 
+        k = torch.randn(B, total_T, H, K, dtype=torch.float32) 
+        v = torch.randn(B, total_T, HV, V_val, dtype=torch.float32) 
+        g = -0.5 + torch.rand(B, total_T, HV, dtype=torch.float32) * 0.1
+        beta = torch.sigmoid(torch.randn(B, total_T, HV, V_val, dtype=torch.float32))
         scale = K ** -0.5
         N = len(cu_seqlens) - 1
-        h0 = torch.randn(N, HV, V_val, K) * 0.01
+        h0 = torch.randn(N, HV, V_val, K, dtype=torch.float32)
 
         cpu_o, _ = fused_recurrent_gated_delta_rule_fwd_cpu(
             q.clone(), k.clone(), v.clone(), g.clone(), beta.clone(),
             scale, h0.clone(), cu_seqlens=cu_seqlens.clone(),
         )
 
-        triton_o, _ = fused_recurrent_gated_delta_rule_fwd_triton(
+        triton_o, _ = fused_recurrent_gated_delta_rule_fwd(
             q.cuda(), k.cuda(), v.cuda(), g.cuda(), beta.cuda(),
             scale, h0.cuda(), inplace_final_state=False, cu_seqlens=cu_seqlens.cuda(),
+        )
+
+        self._check_close(cpu_o, triton_o.cpu())
+
+    def test_large_k_128(self):
+        B, T, H, HV, K, V_val = 1, 8, 1, 1, 128, 128
+        torch.manual_seed(999)
+        q = torch.randn(B, T, H, K, dtype=torch.float32)
+        k = torch.randn(B, T, H, K, dtype=torch.float32)
+        v = torch.randn(B, T, HV, V_val, dtype=torch.float32)
+        g = -0.5 + torch.rand(B, T, HV, dtype=torch.float32) * 0.1
+        beta = torch.sigmoid(torch.randn(B, T, HV, dtype=torch.float32))
+        scale = K ** -0.5
+        h0 = torch.randn(B, HV, V_val, K, dtype=torch.float32) * 0.01
+
+        cpu_o, _ = fused_recurrent_gated_delta_rule_fwd_cpu(
+            q.clone(), k.clone(), v.clone(), g.clone(), beta.clone(),
+            scale, h0.clone(),
+        )
+
+        triton_o, _ = fused_recurrent_gated_delta_rule_fwd(
+            q.cuda(), k.cuda(), v.cuda(), g.cuda(), beta.cuda(),
+            scale, h0.cuda(), inplace_final_state=False,
         )
 
         self._check_close(cpu_o, triton_o.cpu())

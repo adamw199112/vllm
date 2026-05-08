@@ -220,7 +220,7 @@ class TestCPU(unittest.TestCase):
 
     def test_basic_with_gate(self):
         print("\n=== Basic with gate ===")
-        B, T, Hg, K, H, V = 1, 32, 1, 16, 1, 8
+        B, T, Hg, K, H, V = 1, 32, 1, 128, 1, 128
         BT = 32
         torch.manual_seed(42)
         q = torch.randn(B, T, Hg, K) * 0.1

@@ -330,8 +330,8 @@ class TestCPU(unittest.TestCase):
         B = 1
         H = 4
         Hg = 2
-        K = 64
-        V = 32
+        K = 128
+        V = 128
         BT = 64
         torch.manual_seed(456)
 

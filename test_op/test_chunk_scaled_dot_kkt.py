@@ -162,11 +162,11 @@ def test_varlen_with_gate():
     torch.manual_seed(42)
 
     B = 1
-    H = 4
-    K = 16
-    BT = 16
+    H = 2
+    K = 32
+    BT = 32
 
-    lens = torch.tensor([5, 3, 7], dtype=torch.int32)
+    lens = torch.tensor([4, 5], dtype=torch.int32)
     cu_seqlens = torch.cat([torch.tensor([0]), lens.cumsum(0)])
     total_tokens = cu_seqlens[-1].item()
 

@@ -142,7 +142,7 @@ import unittest
 
 sys.path.insert(0, "/home/adam.wang/work/vllm")
 from vllm.model_executor.layers.fla.ops.chunk_delta_h import chunk_gated_delta_rule_fwd_h as chunk_gated_delta_rule_fwd_h_triton
-from vllm.model_executor.layers.fla.ops.index import prepare_chunk_indices
+from vllm.model_executor.layers.fla.ops.index import prepare_chunk_indices, prepare_chunk_offsets
 
 
 def chunk_gated_delta_rule_fwd_h_cpu_varlen(
@@ -157,6 +157,7 @@ def chunk_gated_delta_rule_fwd_h_cpu_varlen(
     save_new_value: bool = True,
     cu_seqlens: torch.Tensor | None = None,
     chunk_indices: torch.Tensor | None = None,
+    chunk_offsets: torch.Tensor | None = None,
 ):
     B, total_T, Hg, K = k.shape
     H = u.shape[-2]

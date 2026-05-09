@@ -1,0 +1,23 @@
+{
+  "skill_name": "triton-kernel-rewrite",
+  "evals": [
+    {
+      "id": 1,
+      "prompt": "Rewrite this Triton kernel to use grid=(1,1) instead of parallel execution, remove the @triton.autotune decorator, and convert the parallel programs into loops inside the kernel. File: /path/to/example_kernel.py",
+      "expected_output": "Modified kernel with grid=(1,1), removed autotune, added loops over batch/head/chunks",
+      "files": ["/path/to/example_kernel.py"]
+    },
+    {
+      "id": 2,
+      "prompt": "Simplify this Triton kernel by removing triton.heuristics and ensuring all parameters are properly passed. Make it single-core execution. File: /home/adam.wang/work/vllm/vllm/model_executor/layers/fla/ops/solve_tril.py",
+      "expected_output": "Kernel with removed heuristics, all parameters have values (no None), single-core grid",
+      "files": ["/home/adam.wang/work/vllm/vllm/model_executor/layers/fla/ops/solve_tril.py"]
+    },
+    {
+      "id": 3,
+      "prompt": "Convert this parallel Triton kernel to use a single program with internal loops. Remove the FLA_XXX_PRECISION environment variable handling and use a fixed precision value instead. File: /some/other/kernel.py",
+      "expected_output": "Single-core kernel with loops, hardcoded precision value",
+      "files": ["/some/other/kernel.py"]
+    }
+  ]
+}

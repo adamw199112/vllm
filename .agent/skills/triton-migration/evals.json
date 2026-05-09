@@ -1,0 +1,47 @@
+{
+  "skill_name": "triton-migration",
+  "evals": [
+    {
+      "id": 1,
+      "prompt": "Convert this block_ptr code to offsets+arange: `p_s = tl.make_block_ptr(s + bos * H + i_h * T, (T,), (1,), (i_t * BT,), (BT,), (0,))` followed by `tl.load(p_s, boundary_check=(0,))`",
+      "expected_output": "Should output offsets + arange form: offsets = i_t * BT + tl.arange(0, BT); base_s = s + bos * H + i_h * T + offsets; tl.load(base_s)",
+      "files": []
+    },
+    {
+      "id": 2,
+      "prompt": "Migrate this triton kernel from tl.make_block_ptr to using tl.arange manually: the kernel uses p = tl.make_block_ptr(x + offset, (T,), (S,), (i*BT,), (BT,), (0,)) for loading and stores with boundary_check",
+      "expected_output": "Should convert to manual offsets: offsets = i*BT + tl.arange(0, BT); base = x + offset + offsets; direct tl.load/tl.store",
+      "files": []
+    },
+    {
+      "id": 3,
+      "prompt": "I'm working on a triton kernel that uses 2D block pointers like tl.make_block_ptr(base, (T, S), (S, 1), (i_t*BT, i_s*BS), (BT, BS), (1, 0)). Convert it to use offsets + tl.arange for both dimensions",
+      "expected_output": "Should have 2D offset calculation with both tl.arange for T and S dimensions",
+      "files": []
+    },
+    {
+      "id": 4,
+      "prompt": "Reverse migration: convert offsets+arange to block_ptr. Given: offsets = i_t * BT + tl.arange(0, BT); base = arr + offsets; data = tl.load(base)",
+      "expected_output": "Should output tl.make_block_ptr form: tl.make_block_ptr(arr, (T,), (1,), (i_t*BT,), (BT,), (0,))",
+      "files": []
+    },
+    {
+      "id": 5,
+      "prompt": "Reverse migration: convert non-head-first layout to block_ptr. Given: base = s + bos*H + i_h + offsets*H where offsets = i_t*BT + tl.arange(0, BT)",
+      "expected_output": "Should output tl.make_block_ptr with stride=H: tl.make_block_ptr(s + bos*H + i_h, (T,), (H,), (i_t*BT,), (BT,), (0,))",
+      "files": []
+    },
+    {
+      "id": 6,
+      "prompt": "Reverse migration 2D: convert 2D offsets+arange to block_ptr. offsets_t = i_t*BT + tl.arange(0, BT); offsets_s = i_s*BS + tl.arange(0, BS); base = arr + offsets_t * S + offsets_s; tl.load(base)",
+      "expected_output": "Should output: tl.make_block_ptr(arr, (T, S), (S, 1), (i_t*BT, i_s*BS), (BT, BS), (1, 0))",
+      "files": []
+    },
+    {
+      "id": 7,
+      "prompt": "Reverse migration with store: convert tl.store(base, data) where base = out + i_t*BT + tl.arange(0, BT) back to block_ptr form",
+      "expected_output": "Should output tl.make_block_ptr form with both load and store",
+      "files": []
+    }
+  ]
+}

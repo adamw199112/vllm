@@ -361,11 +361,11 @@ def chunk_gated_delta_rule_fwd_cpu(
     u = torch.empty(B, T, H, V, dtype=k.dtype)
     h = torch.empty(B, num_chunks, H, V, K, dtype=torch.float32)
     v_new = torch.empty(B, T, H, V, dtype=k.dtype)
-    final_state = torch.empty(N, H, V, K, dtype=torch.float32) if output_final_state else None
+    final_state = torch.empty(N, H, V, K, dtype=torch.float32) 
     o = torch.empty(B, T, H, V, dtype=v.dtype)
 
     # Track running state per (sequence, head) across chunks
-    running_states = {}
+    
 
     # Fused loop: steps 2-6 per chunk
     for idx in range(num_chunks):
@@ -417,10 +417,7 @@ def chunk_gated_delta_rule_fwd_cpu(
                 w[0, bos + t_start : bos + t_end, h_idx, k_s:k_e] = torch.matmul(A_slice, k_sliced * beta_slice[:, None] * g_exp[:, None])
 
             # --- Step 5: chunk_gated_delta_rule_fwd_h (chunked gating matching Triton) ---
-            key = (i_n, h_idx)
-            if key not in running_states:
-                running_states[key] = initial_state[i_n * H + h_idx].clone() if initial_state is not None else torch.zeros(V, K)
-            h_start = running_states[key].clone()
+            h_start = initial_state[i_n * H + h_idx].clone() if initial_state is not None else torch.zeros(V, K)
             h[0, idx, h_idx] = h_start.clone()
 
             last_idx_in_chunk = t_end - 1
@@ -443,7 +440,8 @@ def chunk_gated_delta_rule_fwd_cpu(
                 v_gated = v_new_val * _exp(g_last - g_curr)
                 k_t = k[0, t_idx, k_head_idx_t, :]
                 h_state_cur += torch.outer(k_t, v_gated).T
-            running_states[key] = h_state_cur.clone()
+
+            final_state[i_n, h_idx] = h_state_cur.clone()
 
             # --- Step 6: chunk_fwd_o (same h_idx iteration) ---
             q_chunk = q[0, bos + t_start : bos + t_end, k_head_idx, :]
@@ -460,10 +458,6 @@ def chunk_gated_delta_rule_fwd_cpu(
             o_chunk = (o_chunk + torch.matmul(A_qk, v_chunk)) * scale
             o[0, bos + t_start : bos + t_end, h_idx, :] = o_chunk
 
-    # Fill final_state from accumulated running states
-    if output_final_state:
-        for (i_n, h_idx), state in running_states.items():
-            final_state[i_n, h_idx] = state
 
     return o, final_state, g_cumsum, A, w, h, v_new
 

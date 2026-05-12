@@ -348,11 +348,8 @@ def chunk_gated_delta_rule_fwd_cpu(
     num_chunks = len(chunk_indices)
     N = len(cu_seqlens) - 1
 
-    # Step 1: chunk_local_cumsum (needs separate pass for correctness)
-    g_cumsum = chunk_local_cumsum_cpu(
-        g, chunk_size=chunk_size, reverse=False,
-        cu_seqlens=cu_seqlens, chunk_indices=chunk_indices, head_first=False,
-    )
+    
+    g_cumsum = torch.empty_like(g, dtype=g.dtype)
 
     # Allocate outputs
     A = torch.zeros(B, T, H, BT, dtype=torch.float32)
@@ -367,7 +364,7 @@ def chunk_gated_delta_rule_fwd_cpu(
     # Track running state per (sequence, head) across chunks
     
 
-    # Fused loop: steps 2-6 per chunk
+    # Fused loop: steps 1-6 per chunk
     for idx in range(num_chunks):
         i_n = int(chunk_indices[idx, 0].item())
         i_t = int(chunk_indices[idx, 1].item())
@@ -383,12 +380,15 @@ def chunk_gated_delta_rule_fwd_cpu(
         for h_idx in range(H):
             k_head_idx = h_idx // (H // Hg) if H != Hg else h_idx
 
-            # --- Step 2: chunk_scaled_dot_kkt ---
+            # --- Step 1: chunk_local_cumsum && Step 2: chunk_scaled_dot_kkt ---
             beta_slice = beta[0, bos + t_start : bos + t_end, h_idx]
             k_slice = k[0, bos + t_start : bos + t_end, k_head_idx, :]
             k_beta = k_slice * beta_slice.unsqueeze(1)
             A_chunk = torch.matmul(k_beta, k_slice.T)
-            g_slice = g_cumsum[0, bos + t_start : bos + t_end, h_idx]
+           
+            chunk = g[0, bos + t_start : bos + t_end, h_idx].to(torch.float32)
+            g_slice = torch.cumsum(chunk, dim=0)
+            g_cumsum[0, bos + t_start : bos + t_end, h_idx] = g_slice.to(g.dtype)
             g_diff = g_slice.unsqueeze(1) - g_slice.unsqueeze(0)
             A_chunk = A_chunk * _exp(g_diff)
             causal_mask = torch.tril(torch.ones(cur_BT, cur_BT), diagonal=-1)
